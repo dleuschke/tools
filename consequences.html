@@ -15,7 +15,6 @@
     .line { padding: 4px 0; border-bottom: 1px dotted #ddd; }
     .you { font-weight: 600; }
   </style>
-  <!-- Firebase (no backend code needed) -->
   <script type="module">
     // ---------- Firebase init ----------
     import { initializeApp } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-app.js";
@@ -72,19 +71,16 @@
         if (dc && dc.readyState === "open") dc.send(raw);
       }
     }
-
     function sendTo(peerId, msg){
       const entry = peers.get(peerId);
       if (!entry) return;
       const raw = JSON.stringify(msg);
       if (entry.dc?.readyState === "open") entry.dc.send(raw);
     }
-
     function isMyTurn(){
       const idx = players.findIndex(p => p.id === myId);
       return idx === currentTurnIndex;
     }
-
     function render(){
       el.roomInfo.innerHTML = `
         <div><strong>Room:</strong> ${roomId ?? "-"}</div>
@@ -139,14 +135,19 @@
           if (peers.has(fromId)) continue;
 
           const pc = new RTCPeerConnection(rtcConfig);
-          const dc = pc.createDataChannel("game"); // host creates DC; guest receives ondatachannel
           const peerMeta = { id: fromId, name: name || "Guest" };
-          peers.set(fromId, { pc, dc, meta: peerMeta });
+          peers.set(fromId, { pc, dc: null, meta: peerMeta });
 
-          // Attach handlers to the created DC (important!)
-          dc.onopen = () => hostOnOpen(fromId, dc);
-          dc.onmessage = (ev) => hostOnMessage(fromId, dc, ev.data);
-          dc.onclose = () => hostOnClose(fromId);
+          // Host listens for the *guest-created* DataChannel
+          pc.ondatachannel = (evt) => {
+            const ch = evt.channel;
+            const entry = peers.get(fromId);
+            if (entry) entry.dc = ch;
+
+            ch.onopen = () => hostOnOpen(fromId, ch);
+            ch.onmessage = (ev) => hostOnMessage(fromId, ch, ev.data);
+            ch.onclose  = () => hostOnClose(fromId);
+          };
 
           // Host ICE -> calleeCandidates
           const calleeCandidates = collection(offerDoc.ref, "calleeCandidates");
@@ -164,7 +165,7 @@
             });
           });
 
-          // Now wait for the actual SDP offer to exist before applying it
+          // Wait for the actual SDP offer to exist before applying it
           onSnapshot(offerDoc.ref, async (offerSnap) => {
             const data = offerSnap.data();
             const off = data?.sdpOffer;
@@ -228,9 +229,7 @@
       const cur = players[currentTurnIndex];
       if (!cur) return;
       const window = sliceWindowFor(hostStory.length);
-      // send only to the current player
       sendTo(cur.id, { type: "TURN_START", you: true, visible: window, nextIndex: hostStory.length });
-      // everyone else gets a minimal turn notice
       for (const [peerId] of peers){
         if (peerId !== cur.id) sendTo(peerId, { type: "TURN_START", you: false, visible: [] });
       }
@@ -285,14 +284,13 @@
       const pc = new RTCPeerConnection(rtcConfig);
       hostPC = pc;
 
-      // Guest waits for host's DataChannel
-      pc.ondatachannel = evt => {
-        hostDC = evt.channel;
-        hostDC.onmessage = ev => guestOnMessage(ev.data);
-        hostDC.onopen = () => {
-          hostDC.send(JSON.stringify({ type: "JOIN", id: myId, name: myName }));
-        };
+      // GUEST CREATES THE DATACHANNEL (guest is the offerer)
+      const dc = pc.createDataChannel("game", { negotiated: false });
+      hostDC = dc;
+      dc.onopen = () => {
+        dc.send(JSON.stringify({ type: "JOIN", id: myId, name: myName }));
       };
+      dc.onmessage = (ev) => guestOnMessage(ev.data);
 
       // Create offer doc
       const offersCol = collection(roomRef, "offers");
@@ -345,25 +343,17 @@
         render();
         return;
       }
-
       if (msg.type === "TURN_START"){
         if (msg.you) {
           myVisible = (msg.visible || []).slice(-historyWindow).map(x => ({...x}));
         } else {
-          myVisible = []; // you see nothing during others' turns
+          myVisible = [];
         }
         render();
         return;
       }
-
-      if (msg.type === "LINE_ACCEPTED"){
-        return;
-      }
-
-      if (msg.type === "ERROR"){
-        alert(msg.error);
-        return;
-      }
+      if (msg.type === "LINE_ACCEPTED"){ return; }
+      if (msg.type === "ERROR"){ alert(msg.error); return; }
     }
 
     // ---------- UI handlers ----------
@@ -447,6 +437,6 @@
   <h3>Write your line</h3>
   <textarea id="line" placeholder="Type when it's your turn..."></textarea><br>
   <button id="submit">Submit line</button>
-  <p class="muted">Tip: Host controls turn order (join order) and never sends hidden lines to non-active players.</p>
+  <p class="muted">Tip: Guest creates the DataChannel (as offerer). Host only listens; hidden lines are never broadcast.</p>
 </body>
 </html>
