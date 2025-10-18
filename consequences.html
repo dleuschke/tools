@@ -20,16 +20,16 @@
     // ---------- Firebase init ----------
     import { initializeApp } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-app.js";
     import {
-      getFirestore, doc, setDoc, getDoc, onSnapshot, addDoc, collection, updateDoc, deleteDoc
+      getFirestore, doc, setDoc, getDoc, onSnapshot, addDoc, collection, updateDoc
     } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-firestore.js";
 
     const firebaseConfig = {
-    apiKey: "AIzaSyDebdDZHBDw45gctL8mcPBpGyaLffh0nK4",
-    authDomain: "consequences-ba425.firebaseapp.com",
-    projectId: "consequences-ba425",
-    storageBucket: "consequences-ba425.firebasestorage.app",
-    messagingSenderId: "964149968445",
-    appId: "1:964149968445:web:9a942272e75ac512f3f454"
+      apiKey: "AIzaSyDebdDZHBDw45gctL8mcPBpGyaLffh0nK4",
+      authDomain: "consequences-ba425.firebaseapp.com",
+      projectId: "consequences-ba425",
+      storageBucket: "consequences-ba425.firebasestorage.app",
+      messagingSenderId: "964149968445",
+      appId: "1:964149968445:web:9a942272e75ac512f3f454"
     };
     const app = initializeApp(firebaseConfig);
     const db = getFirestore(app);
@@ -63,11 +63,10 @@
     // ---------- Helpers ----------
     function $(q){ return document.querySelector(q); }
     function setStatus(s){ el.status.textContent = s; }
-    function log(...a){ console.log("[LOG]", ...a); }
     function safeText(s, max=500){ return String(s||"").slice(0,max).trim(); }
+    function escapeHtml(s){ return s.replace(/[<>&]/g, c=>({ '<':'&lt;','>':'&gt;','&':'&amp;' }[c])); }
 
     function broadcastHost(msg){
-      // Host sends tailored messages; but for general broadcast we still loop
       const raw = JSON.stringify(msg);
       for (const {dc} of peers.values()){
         if (dc && dc.readyState === "open") dc.send(raw);
@@ -95,14 +94,12 @@
         }</div>
         <div><strong>History window:</strong> ${historyWindow}</div>
       `;
-      // Visible box (your limited window)
-      el.visibleBox.innerHTML = myVisible.map((ln, i) =>
-        `<div class="line"><span class="muted">#${ln.index}</span> ${ln.text ? ln.text.replace(/[<>&]/g, c=>({ '<':'&lt;','>':'&gt;','&':'&amp;' }[c])):""}</div>`
+      el.visibleBox.innerHTML = myVisible.map((ln) =>
+        `<div class="line"><span class="muted">#${ln.index}</span> ${ln.text ? escapeHtml(ln.text) : ""}</div>`
       ).join("") || `<div class="muted">No lines visible.</div>`;
 
-      // Public list: only shows counts + last reveal time (for spectators)—kept minimal here
       el.storyPublic.innerHTML = isHost
-        ? hostStory.map((ln,i)=>`<div class="line"><span class="muted">#${i}</span> (${ln.by}) ${ln.text}</div>`).join("")
+        ? hostStory.map((ln,i)=>`<div class="line"><span class="muted">#${i}</span> (${ln.by}) ${escapeHtml(ln.text)}</div>`).join("")
         : `<div class="muted">Story length: ${myVisible.length ? (myVisible[myVisible.length-1].index+1) : "?"} (You only see your current window.)</div>`;
 
       el.inputBox.disabled = !isMyTurn();
@@ -113,7 +110,6 @@
     const rtcConfig = {
       iceServers: [
         { urls: ["stun:stun.l.google.com:19302", "stun:global.stun.twilio.com:3478"] }
-        // For reliability later, add a TURN service (Twilio/Metered/etc.)
       ]
     };
 
@@ -131,53 +127,63 @@
         settings: { historyWindow }
       });
 
-      // Track incoming peer offers
       const offersCol = collection(roomRef, "offers");
-      onSnapshot(offersCol, async snap => {
-        for (const ch of snap.docChanges()){
-          if (ch.type !== "added") continue;
-          const offerDoc = ch.doc;
-          const { fromId, name, sdp } = offerDoc.data();
+
+      // React to new offer docs
+      onSnapshot(offersCol, (snap) => {
+        for (const change of snap.docChanges()){
+          if (change.type !== "added") continue;
+          const offerDoc = change.doc;
+          const { fromId, name } = offerDoc.data() || {};
+          if (!fromId) continue;
           if (peers.has(fromId)) continue;
 
           const pc = new RTCPeerConnection(rtcConfig);
-          const dc = pc.createDataChannel("game");
+          const dc = pc.createDataChannel("game"); // host creates DC; guest receives ondatachannel
           const peerMeta = { id: fromId, name: name || "Guest" };
-
           peers.set(fromId, { pc, dc, meta: peerMeta });
 
-          // ICE handling (host side)
-          const calleeCandidates = collection(offerDoc.ref, "calleeCandidates");
-          pc.onicecandidate = e => { if (e.candidate) addDoc(calleeCandidates, e.candidate.toJSON()); };
+          // Attach handlers to the created DC (important!)
+          dc.onopen = () => hostOnOpen(fromId, dc);
+          dc.onmessage = (ev) => hostOnMessage(fromId, dc, ev.data);
+          dc.onclose = () => hostOnClose(fromId);
 
-          // Remote ICE from caller
+          // Host ICE -> calleeCandidates
+          const calleeCandidates = collection(offerDoc.ref, "calleeCandidates");
+          pc.onicecandidate = (e) => {
+            if (e.candidate) addDoc(calleeCandidates, e.candidate.toJSON()).catch(()=>{});
+          };
+
+          // Remote ICE from caller (guest)
           const callerCandidates = collection(offerDoc.ref, "callerCandidates");
-          onSnapshot(callerCandidates, snap2 => {
-            snap2.docChanges().forEach(dc2 => {
-              if (dc2.type === "added") {
-                pc.addIceCandidate(new RTCIceCandidate(dc2.doc.data()));
+          onSnapshot(callerCandidates, (candSnap) => {
+            candSnap.docChanges().forEach((c) => {
+              if (c.type === "added") {
+                try { pc.addIceCandidate(new RTCIceCandidate(c.doc.data())); } catch(_) {}
               }
             });
           });
 
-          pc.ondatachannel = evt => {
-            const ch = evt.channel;
-            ch.onmessage = ev => hostOnMessage(fromId, ch, ev.data);
-            ch.onopen = () => hostOnOpen(fromId, ch);
-            ch.onclose = () => hostOnClose(fromId);
-          };
-
-          await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-
-          await updateDoc(offerDoc.ref, { answer });
+          // Now wait for the actual SDP offer to exist before applying it
+          onSnapshot(offerDoc.ref, async (offerSnap) => {
+            const data = offerSnap.data();
+            const off = data?.sdpOffer;
+            if (!pc.currentRemoteDescription && off && off.type === "offer" && off.sdp) {
+              try {
+                await pc.setRemoteDescription(off);
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                await updateDoc(offerDoc.ref, { sdpAnswer: { type: answer.type, sdp: answer.sdp } });
+              } catch (err) {
+                console.error("Host SDP process error:", err);
+              }
+            }
+          });
 
           // Track players
           players.push({ id: fromId, name: peerMeta.name });
           broadcastRoster();
-
-          setStatus(`Room ${roomId} ready. Peers: ${players.length-1}`);
+          setStatus(`Room ${roomId} ready. Peers: ${players.length - 1}`);
           render();
         }
       });
@@ -221,8 +227,8 @@
     function maybeSendTurnView(){
       const cur = players[currentTurnIndex];
       if (!cur) return;
-      // send only to the current player
       const window = sliceWindowFor(hostStory.length);
+      // send only to the current player
       sendTo(cur.id, { type: "TURN_START", you: true, visible: window, nextIndex: hostStory.length });
       // everyone else gets a minimal turn notice
       for (const [peerId] of peers){
@@ -241,7 +247,6 @@
       try { msg = JSON.parse(raw); } catch { return; }
 
       if (msg.type === "JOIN"){
-        // already handled by signaling; optional re-ack here
         return;
       }
 
@@ -257,12 +262,9 @@
           return;
         }
         hostStory.push({ by: players[playerIdx].name, id: peerId, text });
-        // Confirm to the author
         sendTo(peerId, { type: "LINE_ACCEPTED", index: hostStory.length-1 });
-        // Advance turn
         hostAdvanceTurn();
         render();
-        return;
       }
     }
 
@@ -283,8 +285,7 @@
       const pc = new RTCPeerConnection(rtcConfig);
       hostPC = pc;
 
-      // Data channel (guest waits for host's ondatachannel OR creates one and waits for host?)
-      // Simpler: guest waits for host's dc via ondatachannel
+      // Guest waits for host's DataChannel
       pc.ondatachannel = evt => {
         hostDC = evt.channel;
         hostDC.onmessage = ev => guestOnMessage(ev.data);
@@ -293,30 +294,38 @@
         };
       };
 
+      // Create offer doc
       const offersCol = collection(roomRef, "offers");
       const offerDoc = await addDoc(offersCol, { fromId: myId, name: myName });
 
+      // Our ICE -> callerCandidates
       const callerCandidates = collection(offerDoc, "callerCandidates");
-      pc.onicecandidate = e => { if (e.candidate) addDoc(callerCandidates, e.candidate.toJSON()); };
+      pc.onicecandidate = e => { if (e.candidate) addDoc(callerCandidates, e.candidate.toJSON()).catch(()=>{}); };
 
+      // Create & set local offer FIRST, then write it
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      await updateDoc(offerDoc, { sdp: offer });
+      await updateDoc(offerDoc, { sdpOffer: { type: offer.type, sdp: offer.sdp } });
 
-      // Listen for answer
-      const unsub = onSnapshot(offerDoc, async (snap) => {
+      // Listen for the host's answer; guard for existence
+      onSnapshot(offerDoc, async (snap) => {
         const data = snap.data();
-        if (!pc.currentRemoteDescription && data?.answer){
-          await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+        const ans = data?.sdpAnswer;
+        if (!pc.currentRemoteDescription && ans && ans.type === "answer" && ans.sdp) {
+          try {
+            await pc.setRemoteDescription(ans);
+          } catch (err) {
+            console.error("Guest setRemoteDescription error:", err);
+          }
         }
       });
 
       // Remote ICE from host
       const calleeCandidates = collection(offerDoc, "calleeCandidates");
-      onSnapshot(calleeCandidates, snap => {
-        snap.docChanges().forEach(dc2 => {
+      onSnapshot(calleeCandidates, (candSnap) => {
+        candSnap.docChanges().forEach(dc2 => {
           if (dc2.type === "added") {
-            hostPC.addIceCandidate(new RTCIceCandidate(dc2.doc.data()));
+            try { hostPC.addIceCandidate(new RTCIceCandidate(dc2.doc.data())); } catch(_) {}
           }
         });
       });
@@ -348,7 +357,6 @@
       }
 
       if (msg.type === "LINE_ACCEPTED"){
-        // we could show a tiny toast; turn will advance soon via ROOM_STATE update
         return;
       }
 
@@ -364,11 +372,9 @@
       if (!text) return;
 
       if (isHost){
-        // Host submitting during host’s turn
         const idxSelf = players.findIndex(p => p.id === myId);
         if (idxSelf !== currentTurnIndex) return alert("Not your turn.");
         hostStory.push({ by: myName, id: myId, text });
-        // Acknowledge to self (no DC)
         hostAdvanceTurn();
         el.inputBox.value = "";
         render();
