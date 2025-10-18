@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Consequences (P2P)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 12px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .col { flex: 1 1 280px; min-width: 280px; }
+    textarea { width: 100%; min-height: 120px; }
+    input, button, select { padding: 8px; }
+    pre { background: #f5f5f5; padding: 12px; overflow: auto; }
+    .muted { color: #666; }
+    .line { padding: 4px 0; border-bottom: 1px dotted #ddd; }
+    .you { font-weight: 600; }
+  </style>
+  <!-- Firebase (no backend code needed) -->
+  <script type="module">
+    // ---------- Firebase init ----------
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-app.js";
+    import {
+      getFirestore, doc, setDoc, getDoc, onSnapshot, addDoc, collection, updateDoc, deleteDoc
+    } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-firestore.js";
+
+    const firebaseConfig = {
+    apiKey: "AIzaSyDebdDZHBDw45gctL8mcPBpGyaLffh0nK4",
+    authDomain: "consequences-ba425.firebaseapp.com",
+    projectId: "consequences-ba425",
+    storageBucket: "consequences-ba425.firebasestorage.app",
+    messagingSenderId: "964149968445",
+    appId: "1:964149968445:web:9a942272e75ac512f3f454"
+    };
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+
+    // ---------- App State ----------
+    const el = {
+      createBtn: null, joinBtn: null, roomIdIn: null, nameIn: null,
+      historyWindowIn: null, status: null, visibleBox: null, inputBox: null, submitBtn: null,
+      roomInfo: null, storyPublic: null
+    };
+
+    let isHost = false;
+    let roomId = null;
+    let myId = Math.random().toString(36).slice(2);
+    let myName = "";
+    let historyWindow = 0;
+
+    // Host: hub of RTCPeerConnections keyed by peerId
+    const peers = new Map(); // peerId -> { pc, dc, meta }
+
+    // Guest: single connection to host
+    let hostPC = null;
+    let hostDC = null;
+
+    // Canonical story lives on host; guests keep a limited local view only
+    const hostStory = []; // [{by, text}] host only
+    let myVisible = [];   // what *I* can see this turn
+    let players = [];     // [{id, name}]
+    let currentTurnIndex = 0;
+
+    // ---------- Helpers ----------
+    function $(q){ return document.querySelector(q); }
+    function setStatus(s){ el.status.textContent = s; }
+    function log(...a){ console.log("[LOG]", ...a); }
+    function safeText(s, max=500){ return String(s||"").slice(0,max).trim(); }
+
+    function broadcastHost(msg){
+      // Host sends tailored messages; but for general broadcast we still loop
+      const raw = JSON.stringify(msg);
+      for (const {dc} of peers.values()){
+        if (dc && dc.readyState === "open") dc.send(raw);
+      }
+    }
+
+    function sendTo(peerId, msg){
+      const entry = peers.get(peerId);
+      if (!entry) return;
+      const raw = JSON.stringify(msg);
+      if (entry.dc?.readyState === "open") entry.dc.send(raw);
+    }
+
+    function isMyTurn(){
+      const idx = players.findIndex(p => p.id === myId);
+      return idx === currentTurnIndex;
+    }
+
+    function render(){
+      el.roomInfo.innerHTML = `
+        <div><strong>Room:</strong> ${roomId ?? "-"}</div>
+        <div><strong>You:</strong> ${myName} ${isHost ? "(host)" : ""}</div>
+        <div><strong>Players (${players.length}):</strong> ${
+          players.map((p,i)=>`<span class="${p.id===myId?'you':''}">${i===currentTurnIndex?'👉 ':''}${p.name}</span>`).join(", ")
+        }</div>
+        <div><strong>History window:</strong> ${historyWindow}</div>
+      `;
+      // Visible box (your limited window)
+      el.visibleBox.innerHTML = myVisible.map((ln, i) =>
+        `<div class="line"><span class="muted">#${ln.index}</span> ${ln.text ? ln.text.replace(/[<>&]/g, c=>({ '<':'&lt;','>':'&gt;','&':'&amp;' }[c])):""}</div>`
+      ).join("") || `<div class="muted">No lines visible.</div>`;
+
+      // Public list: only shows counts + last reveal time (for spectators)—kept minimal here
+      el.storyPublic.innerHTML = isHost
+        ? hostStory.map((ln,i)=>`<div class="line"><span class="muted">#${i}</span> (${ln.by}) ${ln.text}</div>`).join("")
+        : `<div class="muted">Story length: ${myVisible.length ? (myVisible[myVisible.length-1].index+1) : "?"} (You only see your current window.)</div>`;
+
+      el.inputBox.disabled = !isMyTurn();
+      el.submitBtn.disabled = !isMyTurn();
+    }
+
+    // ---------- WebRTC config ----------
+    const rtcConfig = {
+      iceServers: [
+        { urls: ["stun:stun.l.google.com:19302", "stun:global.stun.twilio.com:3478"] }
+        // For reliability later, add a TURN service (Twilio/Metered/etc.)
+      ]
+    };
+
+    // ---------- Host flow ----------
+    async function createRoom(){
+      isHost = true;
+      myName = safeText(el.nameIn.value) || "Host";
+      historyWindow = Number(el.historyWindowIn.value || 0);
+      roomId = Math.random().toString(36).slice(2,8).toUpperCase();
+
+      const roomRef = doc(db, "rooms", roomId);
+      await setDoc(roomRef, {
+        createdAt: Date.now(),
+        hostId: myId,
+        settings: { historyWindow }
+      });
+
+      // Track incoming peer offers
+      const offersCol = collection(roomRef, "offers");
+      onSnapshot(offersCol, async snap => {
+        for (const ch of snap.docChanges()){
+          if (ch.type !== "added") continue;
+          const offerDoc = ch.doc;
+          const { fromId, name, sdp } = offerDoc.data();
+          if (peers.has(fromId)) continue;
+
+          const pc = new RTCPeerConnection(rtcConfig);
+          const dc = pc.createDataChannel("game");
+          const peerMeta = { id: fromId, name: name || "Guest" };
+
+          peers.set(fromId, { pc, dc, meta: peerMeta });
+
+          // ICE handling (host side)
+          const calleeCandidates = collection(offerDoc.ref, "calleeCandidates");
+          pc.onicecandidate = e => { if (e.candidate) addDoc(calleeCandidates, e.candidate.toJSON()); };
+
+          // Remote ICE from caller
+          const callerCandidates = collection(offerDoc.ref, "callerCandidates");
+          onSnapshot(callerCandidates, snap2 => {
+            snap2.docChanges().forEach(dc2 => {
+              if (dc2.type === "added") {
+                pc.addIceCandidate(new RTCIceCandidate(dc2.doc.data()));
+              }
+            });
+          });
+
+          pc.ondatachannel = evt => {
+            const ch = evt.channel;
+            ch.onmessage = ev => hostOnMessage(fromId, ch, ev.data);
+            ch.onopen = () => hostOnOpen(fromId, ch);
+            ch.onclose = () => hostOnClose(fromId);
+          };
+
+          await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+
+          await updateDoc(offerDoc.ref, { answer });
+
+          // Track players
+          players.push({ id: fromId, name: peerMeta.name });
+          broadcastRoster();
+
+          setStatus(`Room ${roomId} ready. Peers: ${players.length-1}`);
+          render();
+        }
+      });
+
+      // Host is first player
+      players = [{ id: myId, name: myName }];
+      currentTurnIndex = 0;
+      setStatus(`Created room ${roomId}. Share this code to join.`);
+      render();
+    }
+
+    function hostOnOpen(peerId, ch){
+      // Send initial state *tailored*
+      sendTo(peerId, { type: "ROOM_STATE", players, currentTurnIndex, you: peerId, historyWindow });
+      // If it’s currently this new player’s turn, send window
+      maybeSendTurnView();
+    }
+
+    function hostOnClose(peerId){
+      peers.delete(peerId);
+      players = players.filter(p => p.id !== peerId);
+      if (currentTurnIndex >= players.length) currentTurnIndex = 0;
+      broadcastRoster();
+      maybeSendTurnView();
+      render();
+    }
+
+    function broadcastRoster(){
+      broadcastHost({ type: "ROOM_STATE", players, currentTurnIndex, you: null, historyWindow });
+    }
+
+    function sliceWindowFor(index){
+      if (historyWindow <= 0) return [];
+      const start = Math.max(0, index - historyWindow);
+      return hostStory.slice(start, index).map((ln, i) => ({
+        index: start + i,
+        text: ln.text
+      }));
+    }
+
+    function maybeSendTurnView(){
+      const cur = players[currentTurnIndex];
+      if (!cur) return;
+      // send only to the current player
+      const window = sliceWindowFor(hostStory.length);
+      sendTo(cur.id, { type: "TURN_START", you: true, visible: window, nextIndex: hostStory.length });
+      // everyone else gets a minimal turn notice
+      for (const [peerId] of peers){
+        if (peerId !== cur.id) sendTo(peerId, { type: "TURN_START", you: false, visible: [] });
+      }
+    }
+
+    function hostAdvanceTurn(){
+      currentTurnIndex = (currentTurnIndex + 1) % players.length;
+      broadcastRoster();
+      maybeSendTurnView();
+    }
+
+    function hostOnMessage(peerId, ch, raw){
+      let msg;
+      try { msg = JSON.parse(raw); } catch { return; }
+
+      if (msg.type === "JOIN"){
+        // already handled by signaling; optional re-ack here
+        return;
+      }
+
+      if (msg.type === "SUBMIT_LINE"){
+        const playerIdx = players.findIndex(p => p.id === peerId);
+        if (playerIdx !== currentTurnIndex) {
+          sendTo(peerId, { type: "ERROR", error: "Not your turn." });
+          return;
+        }
+        const text = safeText(msg.text, 500);
+        if (!text) {
+          sendTo(peerId, { type: "ERROR", error: "Empty line." });
+          return;
+        }
+        hostStory.push({ by: players[playerIdx].name, id: peerId, text });
+        // Confirm to the author
+        sendTo(peerId, { type: "LINE_ACCEPTED", index: hostStory.length-1 });
+        // Advance turn
+        hostAdvanceTurn();
+        render();
+        return;
+      }
+    }
+
+    // ---------- Guest flow ----------
+    async function joinRoom(){
+      isHost = false;
+      myName = safeText(el.nameIn.value) || "Guest";
+      historyWindow = 0; // host sets actual
+      roomId = safeText(el.roomIdIn.value).toUpperCase();
+      if (!roomId) return alert("Enter room code.");
+
+      const roomRef = doc(db, "rooms", roomId);
+      const roomSnap = await getDoc(roomRef);
+      if (!roomSnap.exists()){
+        alert("Room not found."); return;
+      }
+
+      const pc = new RTCPeerConnection(rtcConfig);
+      hostPC = pc;
+
+      // Data channel (guest waits for host's ondatachannel OR creates one and waits for host?)
+      // Simpler: guest waits for host's dc via ondatachannel
+      pc.ondatachannel = evt => {
+        hostDC = evt.channel;
+        hostDC.onmessage = ev => guestOnMessage(ev.data);
+        hostDC.onopen = () => {
+          hostDC.send(JSON.stringify({ type: "JOIN", id: myId, name: myName }));
+        };
+      };
+
+      const offersCol = collection(roomRef, "offers");
+      const offerDoc = await addDoc(offersCol, { fromId: myId, name: myName });
+
+      const callerCandidates = collection(offerDoc, "callerCandidates");
+      pc.onicecandidate = e => { if (e.candidate) addDoc(callerCandidates, e.candidate.toJSON()); };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await updateDoc(offerDoc, { sdp: offer });
+
+      // Listen for answer
+      const unsub = onSnapshot(offerDoc, async (snap) => {
+        const data = snap.data();
+        if (!pc.currentRemoteDescription && data?.answer){
+          await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+        }
+      });
+
+      // Remote ICE from host
+      const calleeCandidates = collection(offerDoc, "calleeCandidates");
+      onSnapshot(calleeCandidates, snap => {
+        snap.docChanges().forEach(dc2 => {
+          if (dc2.type === "added") {
+            hostPC.addIceCandidate(new RTCIceCandidate(dc2.doc.data()));
+          }
+        });
+      });
+
+      setStatus(`Joined room ${roomId}. Waiting for host...`);
+      render();
+    }
+
+    function guestOnMessage(raw){
+      let msg;
+      try { msg = JSON.parse(raw); } catch { return; }
+
+      if (msg.type === "ROOM_STATE"){
+        if (Array.isArray(msg.players)) players = msg.players;
+        if (typeof msg.currentTurnIndex === "number") currentTurnIndex = msg.currentTurnIndex;
+        if (typeof msg.historyWindow === "number") historyWindow = msg.historyWindow;
+        render();
+        return;
+      }
+
+      if (msg.type === "TURN_START"){
+        if (msg.you) {
+          myVisible = (msg.visible || []).slice(-historyWindow).map(x => ({...x}));
+        } else {
+          myVisible = []; // you see nothing during others' turns
+        }
+        render();
+        return;
+      }
+
+      if (msg.type === "LINE_ACCEPTED"){
+        // we could show a tiny toast; turn will advance soon via ROOM_STATE update
+        return;
+      }
+
+      if (msg.type === "ERROR"){
+        alert(msg.error);
+        return;
+      }
+    }
+
+    // ---------- UI handlers ----------
+    function submitLine(){
+      const text = safeText(el.inputBox.value, 500);
+      if (!text) return;
+
+      if (isHost){
+        // Host submitting during host’s turn
+        const idxSelf = players.findIndex(p => p.id === myId);
+        if (idxSelf !== currentTurnIndex) return alert("Not your turn.");
+        hostStory.push({ by: myName, id: myId, text });
+        // Acknowledge to self (no DC)
+        hostAdvanceTurn();
+        el.inputBox.value = "";
+        render();
+      } else {
+        if (!hostDC || hostDC.readyState !== "open") return alert("Not connected.");
+        hostDC.send(JSON.stringify({ type: "SUBMIT_LINE", text }));
+        el.inputBox.value = "";
+      }
+    }
+
+    // ---------- Boot ----------
+    window.addEventListener("DOMContentLoaded", () => {
+      el.createBtn = $("#create");
+      el.joinBtn = $("#join");
+      el.roomIdIn = $("#room");
+      el.nameIn = $("#name");
+      el.historyWindowIn = $("#history");
+      el.status = $("#status");
+      el.visibleBox = $("#visible");
+      el.inputBox = $("#line");
+      el.submitBtn = $("#submit");
+      el.roomInfo = $("#roominfo");
+      el.storyPublic = $("#storypublic");
+
+      el.createBtn.onclick = createRoom;
+      el.joinBtn.onclick = joinRoom;
+      el.submitBtn.onclick = submitLine;
+
+      render();
+    });
+  </script>
+</head>
+<body>
+  <h1>Consequences (P2P, no backend)</h1>
+
+  <div class="row">
+    <div class="col">
+      <label>Your name<br><input id="name" placeholder="e.g. Ruth" /></label>
+      <div style="height:8px"></div>
+      <button id="create">Create Room</button>
+      <div style="height:8px"></div>
+      <label>History window (host-only setting)<br>
+        <input id="history" type="number" min="0" value="1" />
+      </label>
+    </div>
+    <div class="col">
+      <label>Room code<br><input id="room" placeholder="AB12CD" /></label>
+      <div style="height:8px"></div>
+      <button id="join">Join Room</button>
+    </div>
+  </div>
+
+  <h3>Status</h3>
+  <div id="status" class="muted">Idle</div>
+
+  <h3>Room</h3>
+  <div id="roominfo"></div>
+
+  <div class="row">
+    <div class="col">
+      <h3>Your visible lines (this turn)</h3>
+      <div id="visible"></div>
+    </div>
+    <div class="col">
+      <h3>Public</h3>
+      <div id="storypublic" class="muted"></div>
+    </div>
+  </div>
+
+  <h3>Write your line</h3>
+  <textarea id="line" placeholder="Type when it's your turn..."></textarea><br>
+  <button id="submit">Submit line</button>
+  <p class="muted">Tip: Host controls turn order (join order) and never sends hidden lines to non-active players.</p>
+</body>
+</html>
